@@ -36,7 +36,7 @@ import pandas as pd
 CONFIG = {
     # ---- raw input paths (relative to script location) ----------------------
     "flipkart_path": os.path.join("data", "raw", "flipkart_fashion_products_dataset.json"),
-    "amazon_path":   os.path.join("data", "raw", "amazon_sale_report.csv"),
+    "amazon_path":   os.path.join("data", "raw", "amazon_india_products_2023.csv"),
     "hces_path":     os.path.join("data", "raw", "hces_level01.csv"),   # fallback used anyway
     # ---- output -------------------------------------------------------------
     "output_path":   os.path.join("data", "final", "model_ready.csv"),
@@ -132,8 +132,13 @@ def load_flipkart(path: str, target: int, random_state: int = 42) -> pd.DataFram
     df = df[(df["discount_pct"] >= 0) & (df["discount_pct"] <= 95)]
 
     # ---- Demand proxy -------------------------------------------------------
-    df["demand_proxy"] = df["out_of_stock"].apply(
-        lambda x: 0.0 if x is True else 1.0
+    df["seller_rating_norm"] = pd.to_numeric(df.get("seller_rating"), errors="coerce").fillna(3.0) / 5.0
+    df["discount_factor"]    = df["discount_pct"] / 100
+    df["in_stock"]           = (df["out_of_stock"] == False).astype(float)
+    df["demand_proxy"] = (
+        df["in_stock"]            * 2.0 +
+        df["seller_rating_norm"]  * 3.0 +
+        df["discount_factor"]     * 2.0
     )
     df["log_demand"] = np.log1p(df["demand_proxy"])
 
@@ -168,14 +173,16 @@ def load_flipkart(path: str, target: int, random_state: int = 42) -> pd.DataFram
 # =============================================================================
 # STEP 3 -- Load & clean Amazon  (target 60,000 rows)
 # =============================================================================
-# Actual Amazon Sale Report columns:
-#   Order ID, Date, Status, Category, Qty, Amount, ship-state, Style, SKU ...
+# amazon_india_products_2023.csv columns:
+#   asin, title, imgUrl, productURL, stars, reviews, price, listPrice,
+#   categoryName, isBestSeller, boughtInLastMonth
 # Mapping:
-#   Amount      -> unit price proxy  (original_price = selling_price = Amount/Qty)
-#   Qty         -> demand_proxy
-#   Category    -> category
-#   Style       -> brand
-#   ship-state  -> geo hint (not used directly)
+#   listPrice   -> original_price  (MRP)
+#   price       -> selling_price   (discounted price)
+#   stars       -> seller_rating
+#   reviews     -> demand_proxy    (no. of ratings)
+#   categoryName -> category
+#   title       -> brand
 # =============================================================================
 def load_amazon(path: str, target: int, random_state: int = 42) -> pd.DataFrame:
     print(f"\n[STEP 3] Loading Amazon from: {path}")
@@ -188,43 +195,37 @@ def load_amazon(path: str, target: int, random_state: int = 42) -> pd.DataFrame:
     )
     print(f"  Raw rows         : {len(df):,}")
 
-    # ---- Clean Amount (revenue per order line) ------------------------------
-    df["Amount"] = _to_float(df.get("Amount", pd.Series(dtype=str)))
-    df["Qty"]    = pd.to_numeric(df.get("Qty",    pd.Series(dtype=str)), errors="coerce").fillna(0)
+    # ---- Price cleaning -----------------------------------------------------
+    df["actual_price"]    = _to_float(df.get("listPrice", pd.Series(dtype=str)))
+    df["discount_price"]  = _to_float(df.get("price",     pd.Series(dtype=str)))
 
-    # Drop rows without valid Amount
-    df = df[df["Amount"].notna() & (df["Amount"] > 0)]
+    # Drop rows where MRP is null or zero
+    df = df[df["actual_price"].notna() & (df["actual_price"] > 0)]
 
-    # Derive unit price: Amount / max(Qty, 1)
-    df["unit_price"] = df["Amount"] / df["Qty"].clip(lower=1)
+    # Where discount_price is missing, assume no discount
+    df["discount_price"] = df["discount_price"].fillna(df["actual_price"])
 
-    # We have no "original price" vs "discounted price" in this file.
-    # Treat unit_price as both original_price and selling_price => discount_pct = 0
-    # (conservative; better than fabricating discounts)
-    df["original_price"] = df["unit_price"]
-    df["selling_price"]  = df["unit_price"]
-    df["discount_pct"]   = 0.0
+    df["original_price"] = df["actual_price"]
+    df["selling_price"]  = df["discount_price"]
+    df["discount_pct"]   = (
+        (df["actual_price"] - df["discount_price"]) / df["actual_price"] * 100
+    ).clip(0, 95)
 
-    # ---- Demand proxy = Qty -------------------------------------------------
-    df["demand_proxy"] = df["Qty"]
+    # ---- Demand proxy = number of reviews -----------------------------------
+    df["reviews"] = (
+        df["reviews"].astype(str)
+                     .str.replace(",", "", regex=False)
+                     .pipe(pd.to_numeric, errors="coerce")
+                     .fillna(0)
+    )
+    df["demand_proxy"] = df["reviews"]
     df["log_demand"]   = np.log1p(df["demand_proxy"])
 
     # ---- Category & brand ---------------------------------------------------
-    df["category"]      = df.get("Category", pd.Series("unknown", index=df.index)).fillna("unknown")
-    df["brand"]         = df.get("Style",    pd.Series("unknown", index=df.index)).fillna("unknown")
-    df["seller_rating"] = np.nan
+    df["category"]      = df.get("categoryName", pd.Series("unknown", index=df.index)).fillna("unknown")
+    df["brand"]         = df.get("title",        pd.Series("unknown", index=df.index)).fillna("unknown")
+    df["seller_rating"] = pd.to_numeric(df.get("stars"), errors="coerce")
     df["source"]        = "amazon"
-
-    # ---- Keep only Shipped / Delivered orders (non-cancelled) ---------------
-    if "Status" in df.columns:
-        valid_statuses = ["Shipped", "Delivered to Buyer", "Shipped - Delivered to Buyer",
-                          "Shipped - Picked Up", "Shipped - Out for Delivery",
-                          "Shipped - Returning to Seller"]
-        mask = df["Status"].isin(valid_statuses)
-        df_filtered = df[mask]
-        if len(df_filtered) > 0:
-            df = df_filtered
-            print(f"  After status filter: {len(df):,} rows")
 
     # ---- Sample -------------------------------------------------------------
     n_avail = len(df)
@@ -271,6 +272,8 @@ _CLOTHING_KW = [
 _ELECTRONICS_KW = [
     "mobile", "phone", "laptop", "tv", "television", "camera", "audio",
     "headphone", "electronic", "tablet", "computer", "watch", "smart",
+    "accessories", "cable", "charger", "speaker", "printer", "monitor",
+    "router", "keyboard", "mouse",
 ]
 
 
@@ -393,13 +396,27 @@ def merge_regional_priors(df: pd.DataFrame, regional_priors: pd.DataFrame) -> pd
 
 
 # =============================================================================
+# STEP 8b -- Add price_tier effect modifier
+# =============================================================================
+def add_price_tier(df: pd.DataFrame) -> pd.DataFrame:
+    print(f"\n[STEP 8b] Adding price_tier ...")
+    df["price_tier"] = pd.cut(
+        df["original_price"],
+        bins=[0, 500, 1500, 5000, np.inf],
+        labels=["budget", "mid", "premium", "luxury"]
+    ).astype(str)
+    print(f"  price_tier distribution:\n{df['price_tier'].value_counts().to_string()}")
+    return df
+
+
+# =============================================================================
 # STEP 9 -- Final cleanup & save
 # =============================================================================
 FINAL_COLUMNS = [
     "original_price", "selling_price", "discount_pct", "demand_proxy",
     "log_demand", "brand", "seller_rating", "category_std", "zone", "sector",
     "avg_mpce_clothing", "avg_mpce_electronics", "avg_mpce_total",
-    "elasticity_weight", "source",
+    "elasticity_weight", "price_tier", "source",
 ]
 
 
@@ -473,6 +490,13 @@ def run_validation(df: pd.DataFrame) -> None:
     actual_sectors  = set(df["sector"].dropna().unique()) if "sector" in df.columns else set()
     checks.append(("6. sector values valid", actual_sectors.issubset(allowed_sectors), str(actual_sectors)))
 
+    # 7. price_tier values
+    allowed_tiers = {"budget", "mid", "premium", "luxury"}
+    actual_tiers  = set(df["price_tier"].dropna().unique()) if "price_tier" in df.columns else set()
+    # exclude pandas NA string representation
+    actual_tiers.discard("nan")
+    checks.append(("7. price_tier values valid", actual_tiers.issubset(allowed_tiers), str(actual_tiers)))
+
     all_passed = True
     for label, ok, detail in checks:
         tag = "PASS" if ok else "FAIL"
@@ -483,6 +507,13 @@ def run_validation(df: pd.DataFrame) -> None:
     print("-" * 60)
     print("  ALL CHECKS PASSED" if all_passed else "  SOME CHECKS FAILED -- review above")
     print("=" * 60 + "\n")
+
+    print("--- Post-fix distribution checks ---")
+    print("log_demand std      :", round(df["log_demand"].std(), 4),   "  (expect > 0.5)")
+    print("discount_pct mean   :", round(df["discount_pct"].mean(), 2), "  (expect 20-40)")
+    print("discount_pct zeros  :", (df["discount_pct"] == 0).sum(),    "  (expect < 5000)")
+    print("category_std counts :\n", df["category_std"].value_counts().to_string())
+    print("price_tier counts   :\n", df["price_tier"].value_counts().to_string())
 
 
 # =============================================================================
@@ -507,6 +538,7 @@ def main():
 
     combined = assign_zone_sector(combined, random_seed=42)
     combined = merge_regional_priors(combined, regional_priors)
+    combined = add_price_tier(combined)
 
     final_df = final_cleanup_and_save(combined, CONFIG["output_path"])
     run_validation(final_df)
