@@ -1,0 +1,55 @@
+# =======================
+# Python
+# =======================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# =======================
+# Virtual Environment
+# =======================
+.venv/
+venv/
+env/
+ENV/
+
+# =======================
+# Data Files (large, not for git)
+# =======================
+data/raw/*.csv
+data/raw/*.json
+data/final/*.csv
+
+# =======================
+# Jupyter Notebooks checkpoints
+# =======================
+.ipynb_checkpoints/
+
+# =======================
+# IDE / Editor
+# =======================
+.vscode/settings.json
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# =======================
+# Logs & Temp
+# =======================
+*.log
+*.tmp
+*.bak
+
+# =======================
+# Environment variables
+# =======================
+.env
+.env.local
